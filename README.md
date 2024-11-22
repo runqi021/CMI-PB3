@@ -1,4 +1,4 @@
-# CMI-PB3
+# H2O_AutoML_3rdCMIPB_Challenge
 
 Overview
 The analysis aimed to predict and rank individuals across various immunological and molecular outcomes post-vaccination using integrated datasets from 2020 to 2023. Robust preprocessing, feature alignment, and H2O AutoML were key to model optimization across all challenges.
