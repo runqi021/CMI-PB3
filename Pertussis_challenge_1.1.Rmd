@@ -1,0 +1,221 @@
+---
+title: "Pertussis Challenge 1.1"
+author: "Runqi Zhang"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    keep_tex: true
+    number_sections: true
+---
+
+
+```{r setup}
+# Load necessary libraries
+suppressPackageStartupMessages({
+  library(dplyr)         # Data manipulation
+  library(tidyr)         # Data reshaping
+  library(readr)         # Reading TSV files
+  library(ggplot2)       # Visualization
+  library(glmnet)        # Regularized regression (LASSO, Ridge)
+  library(agua)          # H2O AutoML integration
+  library(knitr)         # Knitting reports
+  library(tibble)
+})
+
+# Set working directory and initialize H2O
+workDir <- "C:/Users/zhang/Desktop/cmi-pb-3rd-final/Runqi/CMI-PB"
+agua::h2o_start()
+```
+
+
+```{r read-input}
+# Read input data for 2020–2023
+options(readr.show_col_types = FALSE)
+
+read_data <- function(year) {
+  list(
+    pts = read_tsv(file = file.path(workDir, paste0("data/", year, "LD_subject.tsv"))),
+    sample = read_tsv(file = file.path(workDir, paste0("data/", year, "LD_specimen.tsv"))),
+    ab = read_tsv(file = file.path(workDir, paste0("data/", year, "LD_plasma_ab_titer.tsv")))
+  )
+}
+
+data2020 <- read_data("2020")
+data2021 <- read_data("2021")
+data2022 <- read_data("2022")
+data2023 <- list(
+  pts = read_tsv(file = file.path(workDir, "data/2023BD_subject.tsv")),
+  sample = read_tsv(file = file.path(workDir, "data/2023BD_specimen.tsv")),
+  ab = read_tsv(file = file.path(workDir, "data/2023BD_plasma_ab_titer.tsv"))
+)
+```
+
+# Challenge1.1
+```{r challenge1.1-prepare outcome}
+# Prepare aligned target variables for training
+yDF <- data2020$ab %>%
+  filter(isotype == "IgG", antigen == "PT") %>%
+  inner_join(data2020$sample, by = "specimen_id") %>%
+  inner_join(data2020$pts, by = "subject_id") %>%
+  filter(planned_day_relative_to_boost == 14) %>%
+  dplyr::select(subject_id, MFI_normalised)
+
+yDF2 <- data2021$ab %>%
+  filter(isotype == "IgG", antigen == "PT") %>%
+  inner_join(data2021$sample, by = "specimen_id") %>%
+  inner_join(data2021$pts, by = "subject_id") %>%
+  filter(planned_day_relative_to_boost == 14) %>%
+  dplyr::select(subject_id, MFI_normalised)
+ 
+
+yDF3 <- data2022$ab %>%
+  filter(isotype == "IgG", antigen == "PT") %>%
+  inner_join(data2022$sample, by = "specimen_id") %>%
+  inner_join(data2022$pts, by = "subject_id") %>%
+  filter(planned_day_relative_to_boost == 14) %>%
+  dplyr::select(subject_id, MFI_normalised) #%>%
+```
+
+# pts info
+```{r prepare predictors}
+# Function to prepare predictors for Day 0 baseline IgG levels
+prepare_predictors <- function(ab_data, sample_data, pts_data) {
+  ab_data %>%
+    inner_join(sample_data, by = "specimen_id") %>%
+    inner_join(pts_data, by = "subject_id") %>%
+    filter(planned_day_relative_to_boost == 0, grepl("IgG", isotype)) %>%
+    mutate(cname = paste0(isotype, "_", antigen)) %>%
+    dplyr::select(subject_id, cname, MFI_normalised) %>%
+    pivot_wider(names_from = cname, values_from = MFI_normalised) %>%
+    column_to_rownames(var = "subject_id")
+}
+
+# Prepare predictors for all years
+xDF <- prepare_predictors(data2020$ab, data2020$sample, data2020$pts)
+x2DF <- prepare_predictors(data2021$ab, data2021$sample, data2021$pts)
+x3DF <- prepare_predictors(data2022$ab, data2022$sample, data2022$pts)
+x4DF <- prepare_predictors(data2023$ab, data2023$sample, data2023$pts)
+```
+
+
+```{r alignment}
+# Function to align and scale datasets based on the intersection of column names
+align_and_scale <- function(datasets) {
+  # Compute the intersection of column names across all datasets
+  common_cols <- Reduce(intersect, lapply(datasets, colnames))
+  # Align all datasets to the common columns
+  aligned <- lapply(datasets, function(x) x[, common_cols, drop = FALSE])
+  # Scale each dataset independently
+  scaled <- lapply(aligned, scale)
+  return(scaled)
+}
+
+# Apply the function to align and scale the datasets
+datasets <- align_and_scale(list(xDF, x2DF, x3DF, x4DF))
+
+# Extract the processed datasets
+xDF <- datasets[[1]]
+x2DF <- datasets[[2]]
+x3DF <- datasets[[3]]
+x4DF <- datasets[[4]]
+```
+
+```{r model training}
+# Match yDF to xDF by subject_id
+yDF <- yDF %>% slice(match(rownames(xDF), subject_id))
+xDF <- xDF[rownames(xDF) %in% yDF$subject_id, , drop = FALSE]
+yDF2 <- yDF2 %>% slice(match(rownames(x2DF), subject_id))
+x2DF <- x2DF[rownames(x2DF) %in% yDF2$subject_id, , drop = FALSE]
+yDF3 <- yDF3 %>% slice(match(rownames(x3DF), subject_id))
+x3DF <- x3DF[rownames(x3DF) %in% yDF3$subject_id, , drop = FALSE]
+
+trainDF <- rbind(xDF, x2DF, x3DF) %>%
+  as.data.frame() %>%
+  mutate(MFI_normalised = c(
+    yDF$MFI_normalised,
+    yDF2$MFI_normalised,
+    yDF3$MFI_normalised
+  ))
+
+# Train regression model using H2O AutoML
+set.seed(3)
+
+auto_fit <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 5) %>%
+  set_mode("regression") %>%
+  fit(MFI_normalised ~ ., data = trainDF)
+```
+
+```{r validate-model}
+# Predict on training data
+train_predictions <- predict(auto_fit, new_data = trainDF)$.pred
+
+# Calculate correlations
+pearson_cor <- cor(train_predictions, trainDF$MFI_normalised, method = "pearson")
+spearman_cor <- cor(train_predictions, trainDF$MFI_normalised, method = "spearman")
+
+# Display correlation results
+cat("Pearson Correlation: ", pearson_cor, "\n")
+cat("Spearman Correlation: ", spearman_cor, "\n")
+
+# Create a correlation plot
+library(ggplot2)
+
+correlation_plot <- ggplot(data = data.frame(
+  Predicted = train_predictions,
+  Actual = trainDF$MFI_normalised
+), aes(x = Predicted, y = Actual)) +
+  geom_point(alpha = 0.6, color = "darkblue") +  # Scatter plot
+  geom_smooth(method = "lm", color = "red", se = FALSE) +  # Regression line
+  labs(
+    title = "Model Validation: Predicted vs Actual",
+    subtitle = paste0("Pearson: ", round(pearson_cor, 2), 
+                      " | Spearman: ", round(spearman_cor, 2)),
+    x = "Predicted MFI_normalised",
+    y = "Actual MFI_normalised"
+  ) +
+  theme_minimal()
+
+# Display the plot
+print(correlation_plot)
+
+```
+
+
+```{r predict and rank}
+# Predict and rank for 2023
+yhat <- predict(auto_fit, new_data = x4DF)$.pred
+rhat <- rank(-1 * yhat, ties.method = "first")  # Break ties deterministically
+print(cbind(rownames(x4DF), rhat))
+```
+
+```{r update submission file}
+# Load and update submission template
+submission_file <- file.path(workDir, "3rdChallengeSubmissionTemplate_revised.tsv")
+data <- read_tsv(submission_file)
+
+# Update rankings for Challenge 1.1
+ranking_df <- data.frame(
+  SubjectID = as.numeric(rownames(x4DF)),
+  `1.1) IgG-PT-D14-titer-Rank` = rhat,
+  check.names = FALSE # Prevent automatic renaming of column names
+)
+data <- data %>%
+  mutate(
+    `1.1) IgG-PT-D14-titer-Rank` = ifelse(
+      SubjectID %in% ranking_df$SubjectID,
+      ranking_df$`1.1) IgG-PT-D14-titer-Rank`[match(SubjectID, ranking_df$SubjectID)],
+      `1.1) IgG-PT-D14-titer-Rank`
+    )
+  )
+
+# Save updated submission file
+write_tsv(data, submission_file)
+```
+
+```{r session info}
+# End H2O session and display session info
+agua::h2o_end()
+sessionInfo()
+```
+

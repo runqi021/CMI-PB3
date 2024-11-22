@@ -1,0 +1,336 @@
+---
+title: "Pertussis Challenge 3.1_CCL+KAT+STAT"
+author: "Runqi Zhang"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    number_sections: true
+    keep_tex: true
+---
+
+```{r set up}
+# Load libraries and suppress unnecessary output
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(agua)          # H2O AutoML
+  library(edgeR)         # For TMM normalization
+  library(GSVA)          # Gene set variation analysis
+  library(biomaRt)       # Gene ID mapping
+  library(glmnet)        # Regression
+  library(knitr)         # Output formatting
+  library(tibble)        # For handling row names
+  library(impute)
+})
+
+# Define working directory and initialize H2O
+workDir <- "C:/Users/zhang/Desktop/cmi-pb-3rd-final/Runqi/CMI-PB"
+options(readr.show_col_types = FALSE)
+agua::h2o_start()
+
+```
+
+```{r read input}
+# Function to read input data for a given year
+read_data <- function(year, type = "LD") {
+  list(
+    pts = read_tsv(file.path(workDir, paste0("data/", year, type, "_subject.tsv"))),
+    sample = read_tsv(file.path(workDir, paste0("data/", year, type, "_specimen.tsv"))),
+    ge = read_tsv(file.path(workDir, paste0("data/", year, type, "_pbmc_gene_expression.tsv")))
+  )
+}
+
+# Load datasets for 2020–2023
+data2020 <- read_data("2020")
+data2021 <- read_data("2021")
+data2022 <- read_data("2022")
+data2023 <- read_data("2023", type = "BD")
+
+```
+
+```{r prepare outcome}
+# Function to prepare outcome data for CCL3 on day 3
+prepare_outcome_day3 <- function(ge_data, sample_data, pts_data, gene_id, day = 3) {
+  ge_data %>%
+    filter(versioned_ensembl_gene_id == gene_id) %>%
+    inner_join(sample_data, by = "specimen_id") %>%
+    inner_join(pts_data, by = "subject_id") %>%
+    filter(planned_day_relative_to_boost == day) %>%
+    dplyr::select(subject_id, tpm) %>%
+    mutate(tpm_day3 = scale(tpm)) # Scale the TPM values for modeling
+}
+
+# Prepare outcome data for all years
+yDF <- prepare_outcome_day3(data2020$ge, data2020$sample, data2020$pts, "ENSG00000277632.1")
+y2DF <- prepare_outcome_day3(data2021$ge, data2021$sample, data2021$pts, "ENSG00000277632.1")
+y3DF <- prepare_outcome_day3(data2022$ge, data2022$sample, data2022$pts, "ENSG00000277632.1")
+
+```
+
+#top 20 CCL paralogs
+#CCL3 ENSG00000277632.1
+#CCL3L3 ENSG00000276085.1
+#CCL4 ENSG00000275302.1
+#CCL4L2 ENSG00000276070.4
+#CCL5 ENSG00000271503.5
+#CCL14 ENSG00000276409.4
+#CCL15 ENSG00000275718.1
+#CCL18 ENSG00000275385.1
+#CCL22 ENSG00000102962.4
+#CCL23 ENSG00000274736.4
+#CCL26 ENSG00000006606.8
+#CCL24 ENSG00000106178.6
+#CCL16 ENSG00000275152.4
+#CCL1 ENSG00000108702.1
+#CCL17 ENSG00000102970.10
+#CCL25 ENSG00000131142.14
+#CCL7 ENSG00000108688.11
+#CCL19 ENSG00000172724.11
+#CCL8 ENSG00000108700.4
+#XCL1 ENSG00000143184.4
+#XCL2 ENSG00000143185.3
+
+#KAT -> STAT1 -> CCL3 pathway
+#KAT7 ENSG00000136504.11
+#PHF10 ENSG00000130024.14
+#RSF1 ENSG00000048649.14
+#KAT6B ENSG00000156650.12
+#DPF1 ENSG00000011332.19
+#KAT5 ENSG00000172977.12
+#KAT8 ENSG00000103510.19
+#DPF3 ENSG00000205683.11
+#KAT6A ENSG00000083168.9
+#DPF2 ENSG00000133884.9
+
+#STAT1 ENSG00000115415.18
+#STAT2 ENSG00000170581.13
+#STAT3 ENSG00000168610.14
+#STAT4 ENSG00000138378.17
+#STAT5A ENSG00000126561.16
+#STAT6 ENSG00000166888.11
+#STAT5B ENSG00000173757.9
+
+```{r gene expression}
+# Target genes
+target_genes <- c(
+  "ENSG00000277632.1", # CCL3
+  "ENSG00000276085.1", # CCL3L3
+  "ENSG00000275302.1", # CCL4
+  "ENSG00000276070.4", # CCL4L2
+  "ENSG00000271503.5", # CCL5
+  "ENSG00000276409.4", # CCL14
+  "ENSG00000275718.1", # CCL15
+  "ENSG00000275385.1", # CCL18
+  "ENSG00000102962.4", # CCL22
+  "ENSG00000274736.4", # CCL23
+  "ENSG00000006606.8", #CCL26
+  "ENSG00000106178.6", #CCL24 
+  "ENSG00000275152.4", #CCL16
+  "ENSG00000108702.1", #CCL1
+  "ENSG00000102970.10", #CCL17
+  "ENSG00000131142.14", #CCL25
+  "ENSG00000108688.11", #CCL7
+  "ENSG00000172724.11", #CCL19
+  "ENSG00000108700.4", #CCL8
+  "ENSG00000143184.4", #XCL1
+  "ENSG00000143185.3", #XCL2
+  "ENSG00000136504.11", #KAT7 
+  "ENSG00000130024.14", #PHF10
+  "ENSG00000048649.14", #RSF1
+  "ENSG00000156650.12", #KAT6B
+  "ENSG00000011332.19", #DPF1
+  "ENSG00000172977.12", #KAT5
+  "ENSG00000103510.19", #KAT8
+  "ENSG00000205683.11", #DPF3
+  "ENSG00000083168.9", #KAT6A
+  "ENSG00000133884.9", #DPF2
+  "ENSG00000115415.18", #STAT1
+  "ENSG00000170581.13", #STAT2
+  "ENSG00000168610.14", #STAT3
+  "ENSG00000138378.17", #STAT4
+  "ENSG00000126561.16", #STAT5A
+  "ENSG00000166888.11", #STAT6
+  "ENSG00000173757.9" #STAT5B
+)
+
+# Function to extract day 0 TPM values
+extract_day0_tpm <- function(ge_data, sample_data, pts_data, target_genes) {
+  ge_data %>%
+    filter(versioned_ensembl_gene_id %in% target_genes) %>%
+    inner_join(sample_data, by = "specimen_id") %>%
+    inner_join(pts_data, by = "subject_id") %>%
+    filter(planned_day_relative_to_boost == 0) %>%
+    dplyr::select(subject_id, versioned_ensembl_gene_id, tpm) %>%
+    pivot_wider(
+      names_from = versioned_ensembl_gene_id,
+      values_from = tpm,
+      names_prefix = "tpm_"
+    ) %>%
+    replace(is.na(.), 0) %>% # Replace NA with 0
+    column_to_rownames("subject_id") # Use subject_id as rownames
+}
+
+# Extract day 0 TPM values for each dataset
+xDF <- extract_day0_tpm(data2020$ge, data2020$sample, data2020$pts, target_genes)
+x2DF <- extract_day0_tpm(data2021$ge, data2021$sample, data2021$pts, target_genes)
+x3DF <- extract_day0_tpm(data2022$ge, data2022$sample, data2022$pts, target_genes)
+x4DF <- extract_day0_tpm(data2023$ge, data2023$sample, data2023$pts, target_genes)
+
+# Ensure consistent columns across datasets
+common_cols <- Reduce(intersect, list(colnames(xDF), colnames(x2DF), colnames(x3DF), colnames(x4DF)))
+xDF <- xDF[, common_cols]
+x2DF <- x2DF[, common_cols]
+x3DF <- x3DF[, common_cols]
+x4DF <- x4DF[, common_cols]
+
+```
+
+```{r training&predict}
+# Train model with H2O AutoML
+# Combine training data and outcome variable for TPM of CCL3 on day 3
+trainDF <- rbind(xDF, x2DF, x3DF) %>%
+  as.data.frame() %>%
+  mutate(tpm_day3 = c(yDF$tpm_day3, y2DF$tpm_day3, y3DF$tpm_day3))
+
+# Impute missing values if needed
+train_matrix <- as.matrix(trainDF) # Convert to matrix
+imputed_matrix <- impute.knn(train_matrix)$data
+trainDF <- as.data.frame(imputed_matrix) # Convert back to dataframe
+
+# Train the model
+set.seed(3)
+auto_fit <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 5) %>%
+  set_mode("regression") %>%
+  fit(tpm_day3 ~ ., data = trainDF)
+
+```
+
+```{r validation}
+# Validate model on training data
+train_predictions <- predict(auto_fit, new_data = trainDF)$.pred
+
+# Calculate correlations
+pearson_cor <- cor(train_predictions, trainDF$tpm_day3, method = "pearson")
+spearman_cor <- cor(train_predictions, trainDF$tpm_day3, method = "spearman")
+
+# Display correlation results
+cat("Pearson Correlation: ", pearson_cor, "/n")
+cat("Spearman Correlation: ", spearman_cor, "/n")
+
+# Plot validation results
+library(ggplot2)
+
+correlation_plot <- ggplot(data = data.frame(
+  Predicted = train_predictions,
+  Actual = trainDF$tpm_day3
+), aes(x = Predicted, y = Actual)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(
+    title = "Model Validation: Predicted vs Actual TPM for CCL3 (Day 3)",
+    subtitle = paste0("Pearson: ", round(pearson_cor, 2), 
+                      " | Spearman: ", round(spearman_cor, 2)),
+    x = "Predicted TPM (Day 3)",
+    y = "Actual TPM (Day 3)"
+  ) +
+  theme_minimal()
+
+# Display the plot
+print(correlation_plot)
+```
+
+```{r log transfomration}
+# Train model with H2O AutoML
+# Combine training data and outcome variable for TPM of CCL3 on day 3
+trainDF <- rbind(xDF, x2DF, x3DF) %>%
+  as.data.frame() %>%
+  mutate(tpm_day3 = c(yDF$tpm_day3, y2DF$tpm_day3, y3DF$tpm_day3))
+
+trainDF$tpm_day3 <- (log1p(trainDF$tpm_day3))
+
+# Impute missing values if needed
+train_matrix <- as.matrix(trainDF) # Convert to matrix
+imputed_matrix <- impute.knn(train_matrix)$data
+trainDF <- as.data.frame(imputed_matrix) # Convert back to dataframe
+
+# Train the model
+set.seed(3)
+auto_fit <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 5) %>%
+  set_mode("regression") %>%
+  fit(tpm_day3 ~ ., data = trainDF)
+# Validate model on training data
+train_predictions <- predict(auto_fit, new_data = trainDF)$.pred
+
+# Calculate correlations
+pearson_cor <- cor(train_predictions, trainDF$tpm_day3, method = "pearson")
+spearman_cor <- cor(train_predictions, trainDF$tpm_day3, method = "spearman")
+
+# Display correlation results
+cat("Pearson Correlation: ", pearson_cor, "/n")
+cat("Spearman Correlation: ", spearman_cor, "/n")
+
+# Plot validation results
+library(ggplot2)
+
+correlation_plot <- ggplot(data = data.frame(
+  Predicted = train_predictions,
+  Actual = trainDF$tpm_day3
+), aes(x = Predicted, y = Actual)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(
+    title = "Model Validation: Predicted vs Actual TPM for CCL3 (Day 3)",
+    subtitle = paste0("Pearson: ", round(pearson_cor, 2), 
+                      " | Spearman: ", round(spearman_cor, 2)),
+    x = "Predicted TPM (Day 3)",
+    y = "Actual TPM (Day 3)"
+  ) +
+  theme_minimal()
+
+# Display the plot
+print(correlation_plot)
+```
+
+```{r predict and rank}
+# Predict and rank
+yhat <- predict(auto_fit, new_data = x4DF)$.pred
+rhat <- rank(-1 * yhat, ties.method = "first")
+print(cbind(rownames(x4DF), rhat))
+
+```
+
+```{r update submission file}
+# Update submission file with rankings
+submission_file <- file.path(workDir, "3rdChallengeSubmissionTemplate_revised.tsv")
+data <- read_tsv(submission_file)
+
+ranking_df <- data.frame(
+  SubjectID = as.numeric(rownames(x4DF)),
+  "3.1) CCL3-D3-Rank" = rhat,
+  check.names = FALSE
+)
+
+data <- data %>%
+  mutate(
+    `3.1) CCL3-D3-Rank` = ifelse(
+      SubjectID %in% ranking_df$SubjectID,
+      ranking_df$`3.1) CCL3-D3-Rank`[match(SubjectID, ranking_df$SubjectID)],
+      `3.1) CCL3-D3-Rank`
+    )
+  )
+
+write_tsv(data, submission_file)
+
+```
+
+
+```{r session info}
+# End H2O session and print session info
+agua::h2o_end()
+sessionInfo()
+
+```
+

@@ -1,0 +1,433 @@
+---
+title: "Pertussis Challenge 4.1_+ge"
+author: "Runqi Zhang"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+    number_sections: true
+
+---
+
+```{r package}
+# Load required libraries
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(tidyverse)
+  library(readr)
+  library(kableExtra)
+  library(glmnet)
+  library(here)
+  library(knitr)
+  library(GSVA)
+  library(agua)
+  library(tibble)        # For handling row names
+  library(impute)
+  #source(here("./scripts/codebase.R"))
+
+})
+
+# Define working directory and start H2O
+workDir <- "C:/Users/zhang/Desktop/cmi-pb-3rd-final/Runqi/CMI-PB"
+agua::h2o_start()
+options(readr.show_col_types = FALSE)
+
+```
+
+```{r load ge}
+read_data <- function(year, type = "LD") {
+  list(
+    pts = read_tsv(file.path(workDir, paste0("data/", year, type, "_subject.tsv"))),
+    sample = read_tsv(file.path(workDir, paste0("data/", year, type, "_specimen.tsv"))),
+    ge = read_tsv(file.path(workDir, paste0("data/", year, type, "_pbmc_gene_expression.tsv")))
+  )
+}
+
+# Load datasets for 2020–2023
+data2020 <- read_data("2020")
+data2021 <- read_data("2021")
+data2022 <- read_data("2022")
+data2023 <- read_data("2023", type = "BD")
+```
+
+```{r target gene entry}
+# List of base gene IDs (genes of interest)
+target_genes <- c(
+  #"ENSG00000113525.9", #IL5
+  "ENSG00000107485.15", #GATA3
+  #"ENSG00000136574.17", #GATA4
+  "ENSG00000102145.13", #GATA1
+  #"ENSG00000130700.6", #GATA5
+  #"ENSG00000141448.8", #GATA6
+  "ENSG00000179348.11", #GATA2
+  "ENSG00000220201.7", #ZGLP1
+  "ENSG00000104447.12", #TRPS1
+  "ENSG00000071564.14", #TCF3
+  "ENSG00000196628.15", #TCF4
+  "ENSG00000140262.17", #TCF12
+  #"ENSG00000112499.12", #SLC22A2
+  "ENSG00000172216.5", #CEBPB
+  "ENSG00000185591.9", #SP1
+  "ENSG00000167182.14", #SP2
+  "ENSG00000172845.14", #SP3
+  "ENSG00000105866.13" #SP4
+)
+
+```
+
+to be tested
+  "ENSG00000111537.4", #IFNG
+  "ENSG00000105829.11", #BET1
+  "ENSG00000131196.17", #NFATC1
+  "ENSG00000101096.19", #NFATC2
+  "ENSG00000072736.18", #NFATC3
+  #"ENSG00000100968.13", #NFATC4
+  "ENSG00000102908.20", #NFAT5
+  "ENSG00000109320.11", #NFKB1
+  "ENSG00000077150.18", #NFKB2
+  "ENSG00000162924.13", #REL
+  "ENSG00000100811.12", #YY1
+  #"ENSG00000230797.2", #YY2
+  #"ENSG00000179059.9", #ZFP42
+  "ENSG00000115415.18", #STAT1
+  "ENSG00000170581.13", #STAT2
+  "ENSG00000168610.14", #STAT3
+  "ENSG00000138378.17", #STAT4
+  "ENSG00000126561.16", #STAT5A
+  "ENSG00000166888.11", #STAT6
+  "ENSG00000173757.9" #STAT5B
+  
+```{r match gene emselble version id}
+# Function to extract day 0 TPM values
+extract_day0_tpm <- function(ge_data, sample_data, pts_data, target_genes) {
+  ge_data %>%
+    filter(versioned_ensembl_gene_id %in% target_genes) %>%
+    inner_join(sample_data, by = "specimen_id") %>%
+    inner_join(pts_data, by = "subject_id") %>%
+    filter(planned_day_relative_to_boost == 0) %>%
+    dplyr::select(subject_id, versioned_ensembl_gene_id, tpm) %>%
+    pivot_wider(
+      names_from = versioned_ensembl_gene_id,
+      values_from = tpm,
+      names_prefix = "tpm_"
+    ) %>%
+    replace(is.na(.), 0) %>% # Replace NA with 0
+    column_to_rownames("subject_id") # Use subject_id as rownames
+}
+
+# Extract Day 0 TPM values for 2021, 2022, and 2023
+x21_gene_expr <- extract_day0_tpm(data2021$ge, data2021$sample, data2021$pts, target_genes)
+x22_gene_expr <- extract_day0_tpm(data2022$ge, data2022$sample, data2022$pts, target_genes)
+x23_gene_expr <- extract_day0_tpm(data2023$ge, data2023$sample, data2023$pts, target_genes)
+```
+
+
+```{r task4 t-cell activation data loading}
+# Load data for 2021
+pts2021DF <- read_tsv(file.path(workDir, "data/2021LD_subject.tsv"))
+sample2021DF <- read_tsv(file.path(workDir, "data/2021LD_specimen.tsv"))
+tcp2021DF <- read_tsv(file.path(workDir, "data/2021LD_t_cell_polarization.tsv"))
+tca2021DF <- read_tsv(file.path(workDir, "data/2021LD_t_cell_activation.tsv"))
+
+# Load data for 2022
+pts2022DF <- read_tsv(file.path(workDir, "data/2022LD_subject.tsv"))
+sample2022DF <- read_tsv(file.path(workDir, "data/2022LD_specimen.tsv"))
+tcp2022DF <- read_tsv(file.path(workDir, "data/2022LD_t_cell_polarization.tsv"))
+tca2022DF <- read_tsv(file.path(workDir, "data/2022LD_t_cell_activation.tsv"))
+
+# Load data for 2023
+pts2023DF <- read_tsv(file.path(workDir, "data/2023BD_subject.tsv"))
+sample2023DF <- read_tsv(file.path(workDir, "data/2023BD_specimen.tsv"))
+tcp2023DF <- read_tsv(file.path(workDir, "data/2023BD_t_cell_polarization.tsv"))
+tca2023DF <- read_tsv(file.path(workDir, "data/2023BD_t_cell_activation.tsv"))
+```
+
+
+```{r preparing outcome: calculate Th1_Th2_ratio}
+# Function to calculate Th1/Th2 ratio for a given dataset
+calculate_th1_th2_ratio <- function(tcpDF, sampleDF, ptsDF) {
+  tcpDF %>%
+    filter(stimulation == "PT", protein_id %in% c("P01579", "P05113")) %>% # Select IFN-γ and IL-5 with PT stimulation
+    merge(y = sampleDF, by = "specimen_id", all.x = TRUE) %>%              # Merge sample data
+    merge(y = ptsDF, by = "subject_id", all.x = TRUE) %>%                  # Merge patient data
+    filter(planned_day_relative_to_boost == 30) %>%                       # Filter for Day 30 post-booster
+    dplyr::select(subject_id, protein_id, analyte_counts) %>%             # Select relevant columns
+    group_by(subject_id, protein_id) %>%                                  # Group by subject and protein
+    summarize(analyte_counts = mean(analyte_counts, na.rm = TRUE), .groups = "drop") %>% # Aggregate duplicates
+    pivot_wider(names_from = protein_id, values_from = analyte_counts) %>% # Reshape to wide format
+    mutate(Th1_Th2_ratio = P01579 / P05113) %>%                           # Calculate Th1/Th2 ratio
+    dplyr::select(subject_id, Th1_Th2_ratio)                              # Select output columns
+}
+
+# Calculate Th1/Th2 ratio for 2021 and 2022
+y21DF <- calculate_th1_th2_ratio(tcp2021DF, sample2021DF, pts2021DF)
+y22DF <- calculate_th1_th2_ratio(tcp2022DF, sample2022DF, pts2022DF)
+
+
+```
+
+
+```{r data preparation}
+# Process TCP data for a single year
+preprocess_tcp <- function(tcpDF, sampleDF, ptsDF, stimulation_filter, proteins, timepoint) {
+  tcpDF %>%
+    filter(stimulation %in% stimulation_filter, protein_id %in% proteins) %>%
+    merge(y = sampleDF, by = "specimen_id", all.x = TRUE) %>%
+    merge(y = ptsDF, by = "subject_id", all.x = TRUE) %>%
+    filter(planned_day_relative_to_boost == timepoint) %>%
+    dplyr::select(subject_id, stimulation, protein_id, analyte_counts) %>%
+    pivot_wider(
+      names_from = c(stimulation, protein_id),
+      values_from = analyte_counts
+    ) %>%
+    replace(is.na(.), 0) %>%
+    column_to_rownames("subject_id") %>%
+    setNames(make.names(names(.), unique = TRUE))
+}
+
+# Process TCA data for a single year
+preprocess_tca <- function(tcaDF, sampleDF, ptsDF, stimulation_filter, timepoint) {
+  tcaDF %>%
+    filter(stimulation %in% stimulation_filter) %>%
+    merge(y = sampleDF, by = "specimen_id", all.x = TRUE) %>%
+    merge(y = ptsDF, by = "subject_id", all.x = TRUE) %>%
+    filter(planned_day_relative_to_boost == timepoint) %>%
+    dplyr::select(subject_id, stimulation, analyte_percentages) %>%
+    pivot_wider(
+      names_from = stimulation,
+      values_from = analyte_percentages
+    ) %>%
+    replace(is.na(.), 0) %>%
+    column_to_rownames("subject_id") %>%
+    setNames(make.names(names(.), unique = TRUE))
+}
+
+# Combine TCP and TCA predictors for a single year
+combine_tcp_tca <- function(tcpDF, tcaDF, sampleDF, ptsDF, yDF, tcp_stimulation, tcp_proteins, tca_stimulation, timepoint) {
+  # Process TCP
+  tcp_processed <- preprocess_tcp(tcpDF, sampleDF, ptsDF, tcp_stimulation, tcp_proteins, timepoint) %>%
+    rownames_to_column(var = "subject_id") # Add row names back as a column
+  
+  # Process TCA
+  tca_processed <- preprocess_tca(tcaDF, sampleDF, ptsDF, tca_stimulation, timepoint) %>%
+    rownames_to_column(var = "subject_id") # Add row names back as a column
+  
+  # Merge TCP and TCA predictors
+  combined_data <- full_join(
+    tcp_processed, tca_processed,
+    by = "subject_id" # Merge by subject_id
+  ) %>%
+    replace(is.na(.), 0) %>% # Replace NA with 0
+    column_to_rownames(var = "subject_id") # Convert subject_id back to row names
+
+  # Align with response variable
+  combined_data <- combined_data[rownames(combined_data) %in% yDF$subject_id, ]
+
+  return(combined_data)
+}
+
+
+# Define constants
+tcp_stimulation <- c("PT") # TCP stimulation
+tcp_proteins <- c("P01579", "P05113") # IFN-γ and IL-5
+tca_stimulation <- c("PT", "PHA", "DMSO", "TT") # TCA stimulation
+timepoint <- 0 # Baseline (Day 0)
+
+# Process TCP and TCA data for each year
+x21DF <- combine_tcp_tca(tcp2021DF, tca2021DF, sample2021DF, pts2021DF, y21DF, tcp_stimulation, tcp_proteins, tca_stimulation, timepoint)
+x22DF <- combine_tcp_tca(tcp2022DF, tca2022DF, sample2022DF, pts2022DF, y22DF, tcp_stimulation, tcp_proteins, tca_stimulation, timepoint)
+
+# Process TCP and TCA data for 2023
+x23DF <- combine_tcp_tca(
+  tcp2023DF,
+  tca2023DF,
+  sample2023DF,
+  pts2023DF,
+  data.frame(subject_id = pts2023DF$subject_id), # Correct alignment with 2023 subjects
+  tcp_stimulation,
+  tcp_proteins,
+  tca_stimulation,
+  timepoint
+)
+
+# Combine predictors (TCP/TCA data) with Day 0 gene expression
+combine_predictors <- function(predictor_data, gene_expr_data) {
+  # Add rownames as a column for merging
+  predictor_data <- predictor_data %>% rownames_to_column("subject_id")
+  gene_expr_data <- gene_expr_data %>% rownames_to_column("subject_id")
+  
+  # Merge on subject_id to ensure alignment
+  combined_data <- predictor_data %>%
+    full_join(gene_expr_data, by = "subject_id") %>%
+    replace(is.na(.), 0) %>% # Replace NA with 0
+    column_to_rownames("subject_id") # Restore rownames
+  
+  return(combined_data)
+}
+
+# Combine datasets for each year
+x21DF <- combine_predictors(x21DF, x21_gene_expr)
+x22DF <- combine_predictors(x22DF, x22_gene_expr)
+x23DF <- combine_predictors(x23DF, x23_gene_expr)
+
+# Ensure consistent columns across datasets
+common_cols <- Reduce(intersect, list(colnames(x21DF), colnames(x22DF), colnames(x23DF)))
+x21DF <- x21DF[, common_cols]
+x22DF <- x22DF[, common_cols]
+x23DF <- x23DF[, common_cols]
+
+# Match x21DF rows to y21DF subject IDs
+x21DF <- x21DF %>%
+  rownames_to_column("subject_id") %>%  # Convert rownames to a column for matching
+  filter(subject_id %in% y21DF$subject_id) %>%  # Filter rows to include only those in y21DF
+  arrange(match(subject_id, y21DF$subject_id)) %>%  # Reorder rows to match y21DF order
+  column_to_rownames("subject_id")  # Restore subject_id as rownames
+
+# Match x22DF rows to y22DF subject IDs
+x22DF <- x22DF %>%
+  rownames_to_column("subject_id") %>%  # Convert rownames to a column for matching
+  filter(subject_id %in% y22DF$subject_id) %>%  # Filter rows to include only those in y22DF
+  arrange(match(subject_id, y22DF$subject_id)) %>%  # Reorder rows to match y22DF order
+  column_to_rownames("subject_id")  # Restore subject_id as rownames
+```
+
+
+```{r aqua model, include=FALSE}
+# Combine training data and response variable
+trainDF <- rbind(x21DF, x22DF) %>%
+  as.data.frame() %>%
+  mutate(Th1_Th2_ratio = c(y21DF$Th1_Th2_ratio, y22DF$Th1_Th2_ratio))
+
+# Impute missing values if needed
+train_matrix <- as.matrix(trainDF) # Convert to matrix
+imputed_matrix <- impute.knn(train_matrix)$data
+trainDF <- as.data.frame(imputed_matrix) # Convert back to dataframe
+
+# Train regression model
+set.seed(3)
+auto_fit <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 5) %>%
+  set_mode("regression") %>%
+  fit(Th1_Th2_ratio ~ ., data = trainDF)
+
+# Validate model on training data
+train_predictions <- predict(auto_fit, new_data = trainDF)$.pred
+
+# Calculate correlations
+pearson_cor <- cor(train_predictions, trainDF$Th1_Th2_ratio, method = "pearson")
+spearman_cor <- cor(train_predictions, trainDF$Th1_Th2_ratio, method = "spearman")
+
+# Print correlations
+cat("Pearson Correlation: ", pearson_cor, "\n")
+cat("Spearman Correlation: ", spearman_cor, "\n")
+
+# Plot validation results
+ggplot(data = data.frame(
+  Predicted = train_predictions,
+  Actual = trainDF$Th1_Th2_ratio
+), aes(x = Predicted, y = Actual)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(
+    title = "Model Validation: Predicted vs Actual",
+    subtitle = paste0("Pearson: ", round(pearson_cor, 2), " | Spearman: ", round(spearman_cor, 2)),
+    x = "Predicted Th1/Th2 Ratio",
+    y = "Actual Th1/Th2 Ratio"
+  ) +
+  theme_minimal()
+```
+
+
+```{r log transformation}
+# Combine training data and response variable
+trainDF <- rbind(x21DF, x22DF) %>%
+  as.data.frame() %>%
+  mutate(Th1_Th2_ratio = c(y21DF$Th1_Th2_ratio, y22DF$Th1_Th2_ratio))
+
+# Impute missing values if needed
+train_matrix <- as.matrix(trainDF) # Convert to matrix
+imputed_matrix <- impute.knn(train_matrix)$data
+trainDF <- as.data.frame(imputed_matrix) # Convert back to dataframe
+
+trainDF$Th1_Th2_ratio <- log1p(trainDF$Th1_Th2_ratio)
+
+# Train regression model
+set.seed(3)
+auto_fit <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 5) %>%
+  set_mode("regression") %>%
+  fit(Th1_Th2_ratio ~ ., data = trainDF)
+
+# Validate model on training data
+train_predictions <- predict(auto_fit, new_data = trainDF)$.pred
+
+# Calculate correlations
+pearson_cor <- cor(train_predictions, trainDF$Th1_Th2_ratio, method = "pearson")
+spearman_cor <- cor(train_predictions, trainDF$Th1_Th2_ratio, method = "spearman")
+
+# Print correlations
+cat("Pearson Correlation: ", pearson_cor, "\n")
+cat("Spearman Correlation: ", spearman_cor, "\n")
+
+# Plot validation results
+ggplot(data = data.frame(
+  Predicted = train_predictions,
+  Actual = trainDF$Th1_Th2_ratio
+), aes(x = Predicted, y = Actual)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(
+    title = "Model Validation: Predicted vs Actual",
+    subtitle = paste0("Pearson: ", round(pearson_cor, 2), " | Spearman: ", round(spearman_cor, 2)),
+    x = "Predicted Th1/Th2 Ratio",
+    y = "Actual Th1/Th2 Ratio"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r predict and rank}
+# Predict and rank for 2023
+yhat <- predict(auto_fit, new_data = x23DF)$.pred
+rhat <- rank(-1 * yhat, ties.method = "first")
+
+# Print rankings
+print(cbind(rownames(x23DF), rhat))
+
+```
+
+```{r submission file}
+# Save the rankings into a revised submission template
+data <- read_tsv(file.path(workDir, "3rdChallengeSubmissionTemplate_revised.tsv"))
+
+ranking_df <- data.frame(
+  SubjectID = as.numeric(rownames(x23DF)),
+  "4.1) IFNG/IL5-Polarization-D30-Rank" = rhat,
+  check.names = FALSE
+)
+
+data <- data %>%
+  mutate(
+    `4.1) IFNG/IL5-Polarization-D30-Rank` = ifelse(
+      SubjectID %in% ranking_df$SubjectID,
+      ranking_df$`4.1) IFNG/IL5-Polarization-D30-Rank`[match(SubjectID, ranking_df$SubjectID)],
+      `4.1) IFNG/IL5-Polarization-D30-Rank`
+    )
+  )
+
+# Write updated data back to file
+write_tsv(data, file.path(workDir, "3rdChallengeSubmissionTemplate_revised.tsv"))
+```
+
+
+```{r session info}
+# End H2O session and display session info
+agua::h2o_end()
+sessionInfo()
+
+```
+

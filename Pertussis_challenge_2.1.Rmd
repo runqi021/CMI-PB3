@@ -1,0 +1,185 @@
+---
+title: "Pertussis Challenge 2.1"
+author: "Runqi Zhang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    keep_tex: true
+    number_sections: true
+---
+
+```{r setup}
+# Load required libraries
+suppressPackageStartupMessages({
+  library(dplyr)         # Data manipulation
+  library(tidyr)         # Data reshaping
+  library(readr)         # Reading TSV files
+  library(glmnet)        # Regularized regression (LASSO, Ridge)
+  library(agua)          # H2O AutoML integration
+  library(tibble)
+})
+
+# Set working directory and initialize H2O
+workDir <- "C:/Users/zhang/Desktop/cmi-pb-3rd-final/Runqi/CMI-PB"
+options(readr.show_col_types = FALSE)
+agua::h2o_start()
+```
+
+```{r read-input}
+# Function to read input files for a given year
+read_data <- function(year, type = "LD") {
+  list(
+    pts = read_tsv(file.path(workDir, paste0("data/", year, type, "_subject.tsv"))),
+    sample = read_tsv(file.path(workDir, paste0("data/", year, type, "_specimen.tsv"))),
+    ab = read_tsv(file.path(workDir, paste0("data/", year, type, "_plasma_ab_titer.tsv"))),
+    fcm = read_tsv(file.path(workDir, paste0("data/", year, type, "_pbmc_cell_frequency.tsv")))
+  )
+}
+
+# Load datasets for 2020, 2021, 2022, and 2023
+data2020 <- read_data("2020")
+data2021 <- read_data("2021")
+data2022 <- read_data("2022")
+data2023 <- read_data("2023", type = "BD")
+```
+
+```{r prepare-outcome}
+# Extract percent_live_cell for Monocytes from FCM data
+prepare_outcome <- function(fcm_data, sample_data, pts_data) {
+  fcm_data %>%
+    filter(cell_type_name == "Monocytes") %>%
+    inner_join(sample_data, by = "specimen_id") %>%
+    inner_join(pts_data, by = "subject_id") %>%
+    filter(planned_day_relative_to_boost == 1) %>%
+    dplyr::select(subject_id, percent_live_cell)
+}
+
+# Prepare outcome data for each year
+yDF <- prepare_outcome(data2020$fcm, data2020$sample, data2020$pts)
+y2DF <- prepare_outcome(data2021$fcm, data2021$sample, data2021$pts)
+y3DF <- prepare_outcome(data2022$fcm, data2022$sample, data2022$pts)
+```
+
+```{r prepare-predictors}
+# Prepare predictors for Monocytes using baseline data
+prepare_predictors <- function(fcm_data, sample_data, pts_data) {
+  fcm_data %>%
+    mutate(cell_type_name = make.names(cell_type_name)) %>%  # Clean column names
+    inner_join(sample_data, by = "specimen_id") %>%          # Merge with sample data
+    inner_join(pts_data, by = "subject_id") %>%             # Merge with patient data
+    filter(planned_day_relative_to_boost == 0) %>%          # Filter baseline data
+    dplyr::select(subject_id, cell_type_name, percent_live_cell) %>%
+    pivot_wider(
+      names_from = cell_type_name,
+      values_from = percent_live_cell,
+      values_fn = mean,  # Aggregate duplicates using the mean
+      values_fill = 0    # Fill missing values with 0
+    ) %>%
+    column_to_rownames(var = "subject_id")                  # Set rownames
+}
+
+
+# Prepare predictors for each year
+xDF <- prepare_predictors(data2020$fcm, data2020$sample, data2020$pts)
+x2DF <- prepare_predictors(data2021$fcm, data2021$sample, data2021$pts)
+x3DF <- prepare_predictors(data2022$fcm, data2022$sample, data2022$pts)
+x4DF <- prepare_predictors(data2023$fcm, data2023$sample, data2023$pts)
+
+xDF[is.na(xDF)] <- 0
+x2DF[is.na(x2DF)] <- 0
+x3DF[is.na(x3DF)] <- 0
+x4DF[is.na(x4DF)] <- 0
+
+# Align and scale predictors
+common_cols <- Reduce(intersect, list(colnames(xDF), colnames(x2DF), colnames(x3DF), colnames(x4DF)))
+xDF <- scale(xDF[, common_cols, drop = FALSE])
+x2DF <- scale(x2DF[, common_cols, drop = FALSE])
+x3DF <- scale(x3DF[, common_cols, drop = FALSE])
+x4DF <- scale(x4DF[, common_cols, drop = FALSE])
+```
+
+```{r model training}
+# Combine predictors and response variable for training
+trainDF <- rbind(xDF, x2DF, x3DF) %>%
+  as.data.frame() %>%
+  mutate(percent_live_cell = c(yDF$percent_live_cell, y2DF$percent_live_cell, y3DF$percent_live_cell))
+
+# Train regression model using H2O AutoML
+set.seed(3)
+auto_fit <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 5) %>%
+  set_mode("regression") %>%
+  fit(percent_live_cell ~ ., data = trainDF)
+```
+
+```{r validation}
+# Predict on training data
+train_predictions <- predict(auto_fit, new_data = trainDF)$.pred
+
+# Calculate correlations
+pearson_cor <- cor(train_predictions, trainDF$percent_live_cell, method = "pearson")
+spearman_cor <- cor(train_predictions, trainDF$percent_live_cell, method = "spearman")
+
+# Display correlation results
+cat("Pearson Correlation: ", pearson_cor, "\n")
+cat("Spearman Correlation: ", spearman_cor, "\n")
+
+# Create a correlation plot
+library(ggplot2)
+
+correlation_plot <- ggplot(data = data.frame(
+  Predicted = train_predictions,
+  Actual = trainDF$percent_live_cell
+), aes(x = Predicted, y = Actual)) +
+  geom_point(alpha = 0.6, color = "blue") +  # Scatter plot
+  geom_smooth(method = "lm", color = "red", se = FALSE) +  # Regression line
+  labs(
+    title = "Model Validation: Predicted vs Actual Percent Live Cell",
+    subtitle = paste0("Pearson: ", round(pearson_cor, 2), 
+                      " | Spearman: ", round(spearman_cor, 2)),
+    x = "Predicted Percent Live Cell",
+    y = "Actual Percent Live Cell"
+  ) +
+  theme_minimal()
+
+# Display the plot
+print(correlation_plot)
+
+```
+
+```{r predict and rank}
+# Predict on 2023 data and rank predictions
+yhat <- predict(auto_fit, new_data = x4DF)$.pred
+rhat <- rank(-1 * yhat)  # Rank predictions in descending order
+print(cbind(rownames(x4DF), rhat))
+```
+
+```{r update-submission}
+# Read submission template and update rankings
+submission_file <- file.path(workDir, "3rdChallengeSubmissionTemplate_revised.tsv")
+data <- read_tsv(submission_file)
+
+ranking_df <- data.frame(
+  SubjectID = as.numeric(rownames(x4DF)),
+  `2.1) Monocytes-D1-Rank` = rhat,
+  check.names = FALSE # Prevent automatic renaming of column names
+)
+
+data <- data %>%
+  mutate(
+    `2.1) Monocytes-D1-Rank` = ifelse(
+      SubjectID %in% ranking_df$SubjectID,
+      ranking_df$`2.1) Monocytes-D1-Rank`[match(SubjectID, ranking_df$SubjectID)],
+      `2.1) Monocytes-D1-Rank`
+    )
+  )
+
+# Save updated submission file
+write_tsv(data, submission_file)
+```
+
+```{r session-info}
+# End H2O session and display session info
+agua::h2o_end()
+sessionInfo()
+```
